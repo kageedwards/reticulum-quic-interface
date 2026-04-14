@@ -4,7 +4,6 @@ A QUIC transport interface for the [Reticulum Network Stack](https://reticulum.n
 
 Adds a `QUICInterface` type to Reticulum, enabling encrypted UDP-based transport with built-in multiplexing, congestion control, and 0-RTT reconnection. Works as both client and server.
 
-Wire-compatible with the Rust [Ferret](https://github.com/your-org/ferret) QUIC interface — Python and Rust nodes can peer over QUIC directly.
 
 ## Install
 
