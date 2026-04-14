@@ -253,8 +253,6 @@ class QUICClientInterface(_Interface):
         self.receives         = True
 
         self._protocol        = None
-        self._loop            = None
-        self._thread          = None
 
         self.supports_discovery = True
 
@@ -264,17 +262,29 @@ class QUICClientInterface(_Interface):
         else:
             self.max_reconnect_tries = max_reconnect_tries
 
-        thread = threading.Thread(target=self._connect_loop, daemon=True)
-        thread.start()
-
-    def _connect_loop(self):
-        """Run the asyncio event loop for this connection in a background thread."""
+        # Create a single persistent event loop for the lifetime of this interface
         self._loop = asyncio.new_event_loop()
+        self._loop.set_exception_handler(self._loop_exception_handler)
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+        # Schedule the initial connection on the persistent loop
+        asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
+
+    def _loop_exception_handler(self, loop, context):
+        """Handle uncaught exceptions in the event loop without crashing."""
+        msg = context.get("message", "Unhandled exception in event loop")
+        exc = context.get("exception", None)
+        if exc:
+            RNS.log(f"QUICInterface {self.name} loop error: {msg}: {exc}", RNS.LOG_ERROR)
+        else:
+            RNS.log(f"QUICInterface {self.name} loop error: {msg}", RNS.LOG_ERROR)
+
+    def _run_loop(self):
+        """Run the persistent event loop forever in a daemon thread."""
         asyncio.set_event_loop(self._loop)
         try:
-            self._loop.run_until_complete(self._connect())
-            if self.online:
-                self._loop.run_forever()
+            self._loop.run_forever()
         except Exception as e:
             RNS.log(f"QUICInterface {self.name} event loop error: {e}", RNS.LOG_ERROR)
         finally:
@@ -325,11 +335,9 @@ class QUICClientInterface(_Interface):
                 break
 
             try:
-                self._loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self._loop)
-                self._loop.run_until_complete(self._connect())
-                if self.online:
-                    self._loop.run_forever()
+                # Schedule _connect() on the existing persistent event loop
+                future = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
+                future.result()  # Block until _connect() completes
             except Exception as e:
                 RNS.log(f"QUIC reconnect for {self} failed: {e}", RNS.LOG_DEBUG)
 
@@ -377,6 +385,10 @@ class QUICClientInterface(_Interface):
             except: pass
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        if self._loop and not self._loop.is_closed():
+            self._loop.close()
 
     def __str__(self):
         return f"QUICInterface[{self.name}/{self.target_host}:{self.target_port}]"
@@ -435,12 +447,22 @@ class QUICServerInterface(_Interface):
     def _serve_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._loop.set_exception_handler(self._loop_exception_handler)
         try:
             self._loop.run_until_complete(self._serve())
         except Exception as e:
             RNS.log(f"QUICServerInterface {self.name} error: {e}", RNS.LOG_ERROR)
         finally:
             self.online = False
+
+    def _loop_exception_handler(self, loop, context):
+        """Handle uncaught exceptions in the server event loop without crashing."""
+        msg = context.get("message", "Unhandled exception in event loop")
+        exc = context.get("exception", None)
+        if exc:
+            RNS.log(f"QUICServerInterface {self.name} loop error: {msg}: {exc}", RNS.LOG_ERROR)
+        else:
+            RNS.log(f"QUICServerInterface {self.name} loop error: {msg}", RNS.LOG_ERROR)
 
     async def _serve(self):
         config = _make_server_config(self._cert_path, self._key_path)
