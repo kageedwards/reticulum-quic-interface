@@ -207,6 +207,10 @@ if _aioquic_available:
                         self.interface.process_incoming(data)
 
             elif isinstance(event, ConnectionTerminated):
+                # Connection migration note: _handle_disconnect is only
+                # invoked on ConnectionTerminated events, NOT on address
+                # changes. This means QUIC connection migration is handled
+                # transparently by aioquic without triggering a disconnect.
                 if self.interface:
                     self.interface._handle_disconnect()
 
@@ -540,8 +544,27 @@ class QUICServerInterface(_Interface):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self._spawned = None
+                self._last_remote_addr = None
 
             def quic_event_received(self, event):
+                # Detect connection migration by comparing the current
+                # transport remote address to the last known address.
+                # aioquic handles routing internally, so the spawned
+                # interface stays online — we just log the change.
+                if self._transport is not None:
+                    try:
+                        current_addr = self._transport.get_extra_info("peername")
+                    except Exception:
+                        current_addr = None
+                    if current_addr is not None:
+                        if self._last_remote_addr is not None and current_addr != self._last_remote_addr:
+                            RNS.log(
+                                f"QUIC connection migration detected on "
+                                f"{server_interface}: {self._last_remote_addr} -> {current_addr}",
+                                RNS.LOG_DEBUG,
+                            )
+                        self._last_remote_addr = current_addr
+
                 if isinstance(event, DatagramFrameReceived) or isinstance(event, StreamDataReceived):
                     if self._spawned is None:
                         self._spawned = _QUICSpawnedInterface(
