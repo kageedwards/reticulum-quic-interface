@@ -262,6 +262,11 @@ class QUICClientInterface(_Interface):
         else:
             self.max_reconnect_tries = max_reconnect_tries
 
+        # 0-RTT session resumption: ticket store and address key
+        session_ticket_file = c["session_ticket_file"] if "session_ticket_file" in c else None
+        self._ticket_store = TicketStore(persist_path=session_ticket_file)
+        self._address_key = f"{target_host}:{target_port}"
+
         # Create a single persistent event loop for the lifetime of this interface
         self._loop = asyncio.new_event_loop()
         self._loop.set_exception_handler(self._loop_exception_handler)
@@ -290,10 +295,18 @@ class QUICClientInterface(_Interface):
         finally:
             self.online = False
 
+    def _session_ticket_received(self, ticket):
+        """Callback invoked by aioquic when the server issues a session ticket."""
+        self._ticket_store.store(self._address_key, ticket)
+
     async def _connect(self):
+        ticket = self._ticket_store.get(self._address_key)
         try:
             RNS.log(f"Establishing QUIC connection for {self}...", RNS.LOG_DEBUG)
             config = _make_client_config()
+            if ticket is not None:
+                config.session_ticket = ticket
+            config.session_ticket_handler = self._session_ticket_received
             async with quic_connect(
                 self.target_host,
                 self.target_port,
@@ -312,6 +325,40 @@ class QUICClientInterface(_Interface):
         except Exception as e:
             RNS.log(f"QUIC connection for {self} failed: {e}", RNS.LOG_ERROR)
             self.online = False
+
+            # 0-RTT fallback: if a ticket was used and connection failed,
+            # remove the stale ticket and retry with a full handshake
+            if ticket is not None:
+                RNS.log(
+                    f"0-RTT ticket rejected or expired for {self}, "
+                    f"falling back to full handshake",
+                    RNS.LOG_DEBUG,
+                )
+                self._ticket_store.remove(self._address_key)
+                try:
+                    config = _make_client_config()
+                    config.session_ticket_handler = self._session_ticket_received
+                    async with quic_connect(
+                        self.target_host,
+                        self.target_port,
+                        configuration=config,
+                        create_protocol=_RNSQuicProtocol,
+                    ) as protocol:
+                        protocol.interface = self
+                        self._protocol = protocol
+                        self.online = True
+                        self.never_connected = False
+                        RNS.log(
+                            f"QUIC connection for {self} established (full handshake)",
+                            RNS.LOG_DEBUG,
+                        )
+                        await protocol.wait_closed()
+                except Exception as e2:
+                    RNS.log(
+                        f"QUIC full-handshake fallback for {self} failed: {e2}",
+                        RNS.LOG_ERROR,
+                    )
+                    self.online = False
 
         self._handle_disconnect()
 
@@ -467,6 +514,27 @@ class QUICServerInterface(_Interface):
     async def _serve(self):
         config = _make_server_config(self._cert_path, self._key_path)
         server_interface = self
+
+        # Server-side session ticket store for 0-RTT resumption
+        session_ticket_store = {}
+
+        def _server_session_ticket_handler(ticket):
+            """Store a session ticket issued to a client."""
+            try:
+                session_ticket_store[ticket.ticket] = ticket
+            except Exception as e:
+                RNS.log(
+                    f"QUICServerInterface {server_interface.name}: "
+                    f"session_ticket_handler error: {e}",
+                    RNS.LOG_ERROR,
+                )
+
+        def _server_session_ticket_fetcher(ticket_bytes):
+            """Retrieve a previously issued session ticket."""
+            return session_ticket_store.get(ticket_bytes, None)
+
+        config.session_ticket_handler = _server_session_ticket_handler
+        config.session_ticket_fetcher = _server_session_ticket_fetcher
 
         class _ServerProtocol(_RNSQuicProtocol):
             def __init__(self, *args, **kwargs):
