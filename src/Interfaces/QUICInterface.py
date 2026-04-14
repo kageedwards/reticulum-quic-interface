@@ -22,6 +22,7 @@
 import os
 import ssl
 import time
+import pickle
 import asyncio
 import threading
 import tempfile
@@ -52,9 +53,63 @@ try:
         StreamDataReceived,
         ConnectionTerminated,
     )
+    from aioquic.tls import SessionTicket
     _aioquic_available = True
 except ImportError:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Session ticket store for 0-RTT resumption
+# ---------------------------------------------------------------------------
+
+class TicketStore:
+    """In-memory cache for TLS 1.3 session tickets, keyed by server address."""
+
+    def __init__(self, persist_path=None):
+        self._tickets = {}
+        self._persist_path = persist_path
+        if self._persist_path:
+            self._load_from_disk()
+
+    def store(self, address_key, ticket):
+        """Store a ticket for the given address, replacing any existing one."""
+        self._tickets[address_key] = ticket
+        self._save_to_disk()
+
+    def get(self, address_key):
+        """Retrieve the stored ticket for the given address, or None."""
+        return self._tickets.get(address_key, None)
+
+    def remove(self, address_key):
+        """Remove the ticket for the given address, if present."""
+        self._tickets.pop(address_key, None)
+        self._save_to_disk()
+
+    def _save_to_disk(self):
+        """Persist current tickets to disk via pickle. No-op if no persist_path."""
+        if not self._persist_path:
+            return
+        try:
+            with open(self._persist_path, "wb") as f:
+                pickle.dump(self._tickets, f)
+        except Exception as e:
+            RNS.log(
+                f"TicketStore: failed to write {self._persist_path}: {e}",
+                RNS.LOG_WARNING,
+            )
+
+    def _load_from_disk(self):
+        """Load tickets from disk. Logs warning and starts empty on failure."""
+        try:
+            with open(self._persist_path, "rb") as f:
+                self._tickets = pickle.load(f)
+        except Exception as e:
+            RNS.log(
+                f"TicketStore: failed to load {self._persist_path}: {e}",
+                RNS.LOG_WARNING,
+            )
+            self._tickets = {}
 
 
 # ---------------------------------------------------------------------------
@@ -85,17 +140,22 @@ def _make_self_signed_cert():
             .sign(key, hashes.SHA256())
         )
 
-        cert_path = os.path.join(tempfile.gettempdir(), "rns_quic_cert.pem")
-        key_path  = os.path.join(tempfile.gettempdir(), "rns_quic_key.pem")
+        cert_fd, cert_path = tempfile.mkstemp(prefix="rns_quic_", suffix="_cert.pem")
+        key_fd, key_path   = tempfile.mkstemp(prefix="rns_quic_", suffix="_key.pem")
 
-        with open(cert_path, "wb") as f:
-            f.write(cert.public_bytes(serialization.Encoding.PEM))
-        with open(key_path, "wb") as f:
-            f.write(key.private_bytes(
+        try:
+            os.write(cert_fd, cert.public_bytes(serialization.Encoding.PEM))
+        finally:
+            os.close(cert_fd)
+
+        try:
+            os.write(key_fd, key.private_bytes(
                 serialization.Encoding.PEM,
                 serialization.PrivateFormat.TraditionalOpenSSL,
                 serialization.NoEncryption(),
             ))
+        finally:
+            os.close(key_fd)
 
         return cert_path, key_path
 
@@ -436,6 +496,15 @@ class QUICServerInterface(_Interface):
             spawned.detach()
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
+
+        # Clean up temporary cert/key files created for this instance
+        for path in (self._cert_path, self._key_path):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except PermissionError as e:
+                RNS.log(f"QUICServerInterface: could not delete {path}: {e}", RNS.LOG_WARNING)
 
     def __str__(self):
         return f"QUICInterface[{self.name}/{self.listen_ip}:{self.listen_port}]"
