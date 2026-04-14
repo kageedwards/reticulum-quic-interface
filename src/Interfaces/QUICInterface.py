@@ -1,8 +1,7 @@
 # QUICInterface — QUIC transport for Reticulum.
 #
-# Ferret-original interface type. Uses aioquic for the QUIC protocol
-# with self-signed TLS and ALPN "rns". Wire-compatible with the
-# Rust ferret-rns QUICInterface.
+# Uses aioquic for the QUIC protocol with 
+# self-signed TLS and ALPN "rns".
 #
 # Requires: pip install aioquic cryptography
 #
