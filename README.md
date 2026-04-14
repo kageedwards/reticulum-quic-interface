@@ -12,18 +12,18 @@ Wire-compatible with the Rust [Ferret](https://github.com/your-org/ferret) QUIC 
 pip install aioquic cryptography
 ```
 
-Then copy the interface file into your RNS installation:
+Copy the interface into your Reticulum config directory:
 
 ```sh
-cp src/Interfaces/QUICInterface.py \
-   $(python3 -c "import RNS; import os; print(os.path.dirname(RNS.__file__))")/Interfaces/
+cp src/Interfaces/QUICInterface.py ~/.reticulum/interfaces/
 ```
 
-Or symlink it if you prefer to track updates:
+Reticulum automatically loads custom interfaces from `~/.reticulum/interfaces/` — no modifications to the RNS package needed.
+
+If you use a non-default config directory, adjust the path accordingly:
 
 ```sh
-ln -s $(pwd)/src/Interfaces/QUICInterface.py \
-   $(python3 -c "import RNS; import os; print(os.path.dirname(RNS.__file__))")/Interfaces/
+cp src/Interfaces/QUICInterface.py /path/to/your/configdir/interfaces/
 ```
 
 ## Configuration
@@ -70,15 +70,6 @@ TLS uses ephemeral self-signed certificates with ALPN protocol `rns`. Certificat
 
 The server spawns a per-client interface for each incoming connection, matching the pattern used by `TCPServerInterface` and `BackboneInterface`.
 
-## Compatibility
-
-| Peer | Status |
-|------|--------|
-| Python RNS + QUICInterface | should work (same code) |
-| Ferret (Rust) QUICInterface | should work (same ALPN + wire format) |
-
-Both implementations use ALPN `rns`, QUIC datagrams as the primary transport, and uni-stream fallback. The Rust side uses `quinn`/`rustls`, the Python side uses `aioquic`.
-
 ## Why QUIC over TCP?
 
 - No head-of-line blocking (datagrams are independent)
@@ -90,4 +81,4 @@ Both implementations use ALPN `rns`, QUIC datagrams as the primary transport, an
 
 ## License
 
-Same as Reticulum. See the source file header for details.
+MIT

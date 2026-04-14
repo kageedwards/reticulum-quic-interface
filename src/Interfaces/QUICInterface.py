@@ -25,9 +25,16 @@ import time
 import asyncio
 import threading
 import tempfile
-import RNS
 
-from .Interface import Interface
+# Support both normal import (when placed in RNS/Interfaces/) and
+# exec()-based loading (when placed in ~/.reticulum/interfaces/).
+# The external loader injects `RNS` and `Interface` as globals.
+try:
+    import RNS
+    from RNS.Interfaces.Interface import Interface as _Interface
+except ImportError:
+    # When loaded via exec(), RNS and Interface are already in globals
+    _Interface = Interface  # noqa: F821 — injected by Reticulum loader
 
 HW_MTU            = 1200
 BITRATE_GUESS     = 10_000_000
@@ -148,7 +155,7 @@ if _aioquic_available:
 # QUICClientInterface
 # ---------------------------------------------------------------------------
 
-class QUICClientInterface(Interface):
+class QUICClientInterface(_Interface):
     BITRATE_GUESS      = BITRATE_GUESS
     DEFAULT_IFAC_SIZE  = DEFAULT_IFAC_SIZE
     AUTOCONFIGURE_MTU  = True
@@ -164,7 +171,7 @@ class QUICClientInterface(Interface):
                 "Install it with: pip install aioquic"
             )
 
-        c = Interface.get_config_obj(configuration)
+        c = _Interface.get_config_obj(configuration)
         name        = c["name"]
         target_host = c["target_host"]
         target_port = int(c["target_port"])
@@ -181,7 +188,7 @@ class QUICClientInterface(Interface):
         self.initiator        = True
         self.reconnecting     = False
         self.never_connected  = True
-        self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
+        self.mode             = _Interface.MODE_FULL
         self.bitrate          = self.BITRATE_GUESS
         self.receives         = True
 
@@ -319,7 +326,7 @@ class QUICClientInterface(Interface):
 # QUICServerInterface
 # ---------------------------------------------------------------------------
 
-class QUICServerInterface(Interface):
+class QUICServerInterface(_Interface):
     BITRATE_GUESS     = BITRATE_GUESS
     DEFAULT_IFAC_SIZE = DEFAULT_IFAC_SIZE
 
@@ -332,7 +339,7 @@ class QUICServerInterface(Interface):
                 "Install it with: pip install aioquic"
             )
 
-        c = Interface.get_config_obj(configuration)
+        c = _Interface.get_config_obj(configuration)
         name      = c["name"]
         listen_ip = c["listen_ip"] if "listen_ip" in c else "0.0.0.0"
         listen_port = int(c["listen_port"]) if "listen_port" in c else 4244
@@ -346,7 +353,7 @@ class QUICServerInterface(Interface):
         self.owner            = owner
         self.online           = False
         self.detached         = False
-        self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
+        self.mode             = _Interface.MODE_FULL
         self.bitrate          = self.BITRATE_GUESS
         self.receives         = True
 
@@ -434,7 +441,7 @@ class QUICServerInterface(Interface):
         return f"QUICInterface[{self.name}/{self.listen_ip}:{self.listen_port}]"
 
 
-class _QUICSpawnedInterface(Interface):
+class _QUICSpawnedInterface(_Interface):
     """A per-client interface spawned by QUICServerInterface."""
 
     def __init__(self, parent, protocol, connection_id):
@@ -447,7 +454,7 @@ class _QUICSpawnedInterface(Interface):
         self.name             = f"Client on {parent.name}"
         self.parent_interface = parent
         self.owner            = parent.owner
-        self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
+        self.mode             = _Interface.MODE_FULL
         self.bitrate          = BITRATE_GUESS
         self.receives         = True
         self._protocol        = protocol
@@ -511,8 +518,12 @@ class QUICInterface:
         pass
 
     def __new__(cls, owner, configuration):
-        c = Interface.get_config_obj(configuration)
+        c = _Interface.get_config_obj(configuration)
         if "target_host" in c and c["target_host"] is not None:
             return QUICClientInterface(owner, configuration)
         else:
             return QUICServerInterface(owner, configuration)
+
+# Required by Reticulum's external interface loader (exec-based).
+# When placed in ~/.reticulum/interfaces/, the loader looks for this global.
+interface_class = QUICInterface
