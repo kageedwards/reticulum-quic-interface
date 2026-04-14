@@ -58,6 +58,7 @@ Add a section to your `~/.reticulum/config` file.
 | `listen_ip` | `0.0.0.0` | Bind address (server mode) |
 | `listen_port` | `4244` | Bind port (server mode) |
 | `max_reconnect_tries` | unlimited | Max client reconnect attempts |
+| `session_ticket_file` | — | Path to persist session tickets for 0-RTT resumption (client only) |
 
 If `target_host` is present, the interface runs as a client. Otherwise it runs as a server.
 
@@ -69,6 +70,37 @@ TLS uses ephemeral self-signed certificates with ALPN protocol `rns`. Certificat
 
 The server spawns a per-client interface for each incoming connection, matching the pattern used by `TCPServerInterface` and `BackboneInterface`.
 
+## Features
+
+### 0-RTT Session Resumption
+
+The server issues TLS 1.3 session tickets after each successful handshake. The client caches these tickets in memory and uses them on reconnect to establish 0-RTT connections, skipping a full TLS handshake round-trip.
+
+Set `session_ticket_file` in the client config to persist tickets across restarts:
+
+```ini
+[[QUIC Transport]]
+  type = QUICInterface
+  enabled = yes
+  target_host = 10.0.0.1
+  target_port = 4244
+  session_ticket_file = /path/to/tickets.dat
+```
+
+If a cached ticket is rejected or expired, the client falls back to a full handshake automatically.
+
+### Connection Migration
+
+QUIC connections survive client IP address or port changes (NAT rebind, network switch, mobile roaming) without requiring a full reconnect. The server logs address changes at debug level and continues processing data on the existing connection.
+
+### Persistent Event Loop
+
+Each interface maintains a single asyncio event loop for its entire lifetime. Reconnection attempts are scheduled on the existing loop rather than creating a new one each time, avoiding resource leaks and improving lifecycle management.
+
+### Instance-Safe Certificates
+
+Each server instance generates a unique self-signed certificate using random temporary filenames. Multiple server instances on the same machine won't conflict. Certificate files are cleaned up on detach.
+
 ## Why QUIC over TCP?
 
 - No head-of-line blocking (datagrams are independent)
@@ -77,6 +109,7 @@ The server spawns a per-client interface for each incoming connection, matching 
 - Better performance over lossy links (independent packet loss recovery)
 - NAT traversal friendly (UDP-based)
 - 0-RTT reconnection for returning clients
+- Connection migration survives network changes
 
 ## License
 
