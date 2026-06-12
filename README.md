@@ -64,7 +64,7 @@ If `target_host` is present, the interface runs as a client. Otherwise it runs a
 
 ## How it works
 
-QUIC runs over UDP with TLS 1.3 encryption. Reticulum packets are sent as QUIC datagrams when they fit (no head-of-line blocking), with automatic fallback to unidirectional streams for oversized packets.
+QUIC runs over UDP with TLS 1.3 encryption. Reticulum packets are sent as QUIC datagrams when they fit within a single QUIC packet (no head-of-line blocking), with automatic fallback to unidirectional streams for oversized packets. Datagram support is negotiated during the handshake (RFC 9221), and the datagram-vs-stream decision is made per packet against the negotiated datagram size.
 
 TLS uses ephemeral self-signed certificates with ALPN protocol `rns`. Certificate verification is disabled — Reticulum handles authentication at the protocol layer via IFAC and Identity.
 
@@ -72,9 +72,12 @@ The server spawns a per-client interface for each incoming connection, matching 
 
 ## Features
 
-### 0-RTT Session Resumption
+### Session Resumption (0-RTT)
 
-The server issues TLS 1.3 session tickets after each successful handshake. The client caches these tickets in memory and uses them on reconnect to establish 0-RTT connections, skipping a full TLS handshake round-trip.
+The server enables TLS 1.3 early data and issues session tickets after each
+successful handshake. The client caches these tickets and presents them on
+reconnect, allowing a 0-RTT-capable resumption handshake that skips the
+certificate exchange.
 
 Set `session_ticket_file` in the client config to persist tickets across restarts:
 
@@ -84,14 +87,16 @@ Set `session_ticket_file` in the client config to persist tickets across restart
   enabled = yes
   target_host = 10.0.0.1
   target_port = 4244
-  session_ticket_file = /path/to/tickets.dat
+  session_ticket_file = /path/to/tickets.json
 ```
 
-If a cached ticket is rejected or expired, the client falls back to a full handshake automatically.
+Tickets are stored as JSON (not pickle), so loading the file can never execute
+arbitrary code even if it is tampered with. If a cached ticket is rejected or
+expired, the client falls back to a full handshake automatically.
 
 ### Connection Migration
 
-QUIC connections survive client IP address or port changes (NAT rebind, network switch, mobile roaming) without requiring a full reconnect. The server logs address changes at debug level and continues processing data on the existing connection.
+QUIC connections survive client IP address or port changes (NAT rebind, network switch, mobile roaming) without requiring a full reconnect. aioquic keeps routing on the existing connection ID; the server observes the changed UDP source address on incoming packets and logs the path change at debug level while continuing on the same connection.
 
 ### Persistent Event Loop
 

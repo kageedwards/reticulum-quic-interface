@@ -21,9 +21,11 @@
 
 import os
 import ssl
+import json
 import time
-import pickle
+import base64
 import asyncio
+import datetime
 import threading
 import tempfile
 
@@ -43,6 +45,18 @@ DEFAULT_IFAC_SIZE = 16
 RECONNECT_WAIT    = 5
 ALPN_PROTOCOL     = "rns"
 
+# QUIC DATAGRAM extension (RFC 9221). Both peers must advertise a non-None
+# max_datagram_frame_size during the handshake, otherwise a received DATAGRAM
+# frame is a PROTOCOL_VIOLATION and the connection is torn down.
+MAX_DATAGRAM_FRAME_SIZE = 65536
+
+# Conservative allowance for the QUIC short-header packet overhead plus the
+# DATAGRAM frame header. A QUIC datagram must fit in a single packet (it cannot
+# be fragmented), so we only send a packet as a datagram when it fits within
+# the negotiated datagram size minus this overhead. Anything larger falls back
+# to a unidirectional stream.
+QUIC_DATAGRAM_OVERHEAD = 64
+
 _aioquic_available = False
 try:
     from aioquic.asyncio import connect as quic_connect, serve as quic_serve
@@ -60,11 +74,55 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Session ticket store for 0-RTT resumption
+# Session ticket store for session resumption (TLS 1.3 / 0-RTT)
 # ---------------------------------------------------------------------------
 
+def _ticket_to_dict(t):
+    """Serialize an aioquic SessionTicket to JSON-safe primitives."""
+    return {
+        "age_add": t.age_add,
+        "cipher_suite": int(t.cipher_suite),
+        "not_valid_after": t.not_valid_after.timestamp(),
+        "not_valid_before": t.not_valid_before.timestamp(),
+        "resumption_secret": base64.b64encode(t.resumption_secret).decode("ascii"),
+        "server_name": t.server_name,
+        "ticket": base64.b64encode(t.ticket).decode("ascii"),
+        "max_early_data_size": t.max_early_data_size,
+        "other_extensions": [
+            [int(ext_type), base64.b64encode(ext_data).decode("ascii")]
+            for ext_type, ext_data in t.other_extensions
+        ],
+    }
+
+
+def _ticket_from_dict(d):
+    """Reconstruct an aioquic SessionTicket from _ticket_to_dict() output."""
+    return SessionTicket(
+        age_add=d["age_add"],
+        cipher_suite=d["cipher_suite"],
+        not_valid_after=datetime.datetime.fromtimestamp(
+            d["not_valid_after"], tz=datetime.timezone.utc
+        ),
+        not_valid_before=datetime.datetime.fromtimestamp(
+            d["not_valid_before"], tz=datetime.timezone.utc
+        ),
+        resumption_secret=base64.b64decode(d["resumption_secret"]),
+        server_name=d["server_name"],
+        ticket=base64.b64decode(d["ticket"]),
+        max_early_data_size=d.get("max_early_data_size"),
+        other_extensions=[
+            (ext_type, base64.b64decode(ext_data))
+            for ext_type, ext_data in d.get("other_extensions", [])
+        ],
+    )
+
+
 class TicketStore:
-    """In-memory cache for TLS 1.3 session tickets, keyed by server address."""
+    """In-memory cache for TLS 1.3 session tickets, keyed by server address.
+
+    Tickets are persisted as JSON rather than pickle so loading a store file
+    can never execute arbitrary code, even if the file has been tampered with.
+    """
 
     def __init__(self, persist_path=None):
         self._tickets = {}
@@ -87,12 +145,16 @@ class TicketStore:
         self._save_to_disk()
 
     def _save_to_disk(self):
-        """Persist current tickets to disk via pickle. No-op if no persist_path."""
+        """Persist current tickets to disk as JSON. No-op if no persist_path."""
         if not self._persist_path:
             return
         try:
-            with open(self._persist_path, "wb") as f:
-                pickle.dump(self._tickets, f)
+            serializable = {
+                key: _ticket_to_dict(ticket)
+                for key, ticket in self._tickets.items()
+            }
+            with open(self._persist_path, "w") as f:
+                json.dump(serializable, f)
         except Exception as e:
             RNS.log(
                 f"TicketStore: failed to write {self._persist_path}: {e}",
@@ -102,8 +164,13 @@ class TicketStore:
     def _load_from_disk(self):
         """Load tickets from disk. Logs warning and starts empty on failure."""
         try:
-            with open(self._persist_path, "rb") as f:
-                self._tickets = pickle.load(f)
+            with open(self._persist_path, "r") as f:
+                raw = json.load(f)
+            self._tickets = {
+                key: _ticket_from_dict(value) for key, value in raw.items()
+            }
+        except FileNotFoundError:
+            self._tickets = {}
         except Exception as e:
             RNS.log(
                 f"TicketStore: failed to load {self._persist_path}: {e}",
@@ -167,12 +234,19 @@ def _make_self_signed_cert():
 def _make_client_config():
     config = QuicConfiguration(is_client=True, alpn_protocols=[ALPN_PROTOCOL])
     config.verify_mode = ssl.CERT_NONE
+    # Advertise DATAGRAM support so unreliable, head-of-line-blocking-free
+    # datagrams can be negotiated for the common (small packet) path.
+    config.max_datagram_frame_size = MAX_DATAGRAM_FRAME_SIZE
     return config
 
 
 def _make_server_config(cert_path, key_path):
     config = QuicConfiguration(is_client=False, alpn_protocols=[ALPN_PROTOCOL])
     config.load_cert_chain(cert_path, key_path)
+    config.max_datagram_frame_size = MAX_DATAGRAM_FRAME_SIZE
+    # Permit early data so resumed connections perform a genuine 0-RTT
+    # handshake rather than a 1-RTT abbreviated one.
+    config.max_early_data_size = 0xFFFFFFFF
     return config
 
 
@@ -188,6 +262,61 @@ if _aioquic_available:
             super().__init__(*args, **kwargs)
             self.interface = None
             self._stream_buffers = {}
+            self._last_peer_addr = None
+
+        def datagram_received(self, data, addr):
+            # Observe the actual UDP source address on every received packet.
+            # When it changes mid-connection (NAT rebind, network switch,
+            # mobile roaming), QUIC connection migration has occurred. aioquic
+            # keeps routing on the existing connection ID, so the interface
+            # stays online — we just log the path change. This is the correct
+            # place to detect it: the asyncio transport peername is unreliable
+            # for a server's shared, unconnected UDP socket.
+            if self._last_peer_addr is not None and addr != self._last_peer_addr:
+                target = self.interface if self.interface is not None else self
+                RNS.log(
+                    f"QUIC path migration on {target}: "
+                    f"{self._last_peer_addr} -> {addr}",
+                    RNS.LOG_DEBUG,
+                )
+            self._last_peer_addr = addr
+            super().datagram_received(data, addr)
+
+        def _datagram_payload_limit(self):
+            """Largest packet (in bytes) that fits in a single QUIC datagram.
+
+            Returns 0 if the peer did not negotiate DATAGRAM support, forcing
+            the stream path.
+            """
+            quic = self._quic
+            remote_max = getattr(quic, "_remote_max_datagram_frame_size", None)
+            if not remote_max:
+                return 0
+            max_dgram = getattr(quic, "_max_datagram_size", 1200)
+            return max(0, min(remote_max, max_dgram) - QUIC_DATAGRAM_OVERHEAD)
+
+        def send_packet(self, data):
+            """Send one RNS packet over this connection.
+
+            Chooses a QUIC DATAGRAM frame when the packet fits in a single
+            datagram (no head-of-line blocking), otherwise falls back to a
+            short-lived unidirectional stream. MUST be invoked on the event
+            loop thread — aioquic connection state is not thread-safe.
+            """
+            try:
+                if len(data) <= self._datagram_payload_limit():
+                    self._quic.send_datagram_frame(data)
+                else:
+                    stream_id = self._quic.get_next_available_stream_id(
+                        is_unidirectional=True
+                    )
+                    self._quic.send_stream_data(stream_id, data, end_stream=True)
+                self.transmit()
+                return True
+            except Exception as e:
+                target = self.interface if self.interface is not None else "QUIC"
+                RNS.log(f"QUIC transmit error on {target}: {e}", RNS.LOG_ERROR)
+                return False
 
         def quic_event_received(self, event):
             if isinstance(event, DatagramFrameReceived):
@@ -207,10 +336,6 @@ if _aioquic_available:
                         self.interface.process_incoming(data)
 
             elif isinstance(event, ConnectionTerminated):
-                # Connection migration note: _handle_disconnect is only
-                # invoked on ConnectionTerminated events, NOT on address
-                # changes. This means QUIC connection migration is handled
-                # transparently by aioquic without triggering a disconnect.
                 if self.interface:
                     self.interface._handle_disconnect()
 
@@ -266,7 +391,7 @@ class QUICClientInterface(_Interface):
         else:
             self.max_reconnect_tries = max_reconnect_tries
 
-        # 0-RTT session resumption: ticket store and address key
+        # Session resumption: ticket store and address key
         session_ticket_file = c["session_ticket_file"] if "session_ticket_file" in c else None
         self._ticket_store = TicketStore(persist_path=session_ticket_file)
         self._address_key = f"{target_host}:{target_port}"
@@ -330,11 +455,11 @@ class QUICClientInterface(_Interface):
             RNS.log(f"QUIC connection for {self} failed: {e}", RNS.LOG_ERROR)
             self.online = False
 
-            # 0-RTT fallback: if a ticket was used and connection failed,
-            # remove the stale ticket and retry with a full handshake
+            # Resumption fallback: if a ticket was used and the connection
+            # failed, drop the stale ticket and retry with a full handshake
             if ticket is not None:
                 RNS.log(
-                    f"0-RTT ticket rejected or expired for {self}, "
+                    f"Session ticket rejected or expired for {self}, "
                     f"falling back to full handshake",
                     RNS.LOG_DEBUG,
                 )
@@ -400,46 +525,45 @@ class QUICClientInterface(_Interface):
             self.owner.inbound(data, self)
 
     def process_outgoing(self, data):
+        # Marshal the actual send onto the event loop thread. aioquic's
+        # connection objects are not thread-safe, so we must never touch
+        # self._protocol._quic or call transmit() from Reticulum's outbound
+        # thread directly.
         if self.online and not self.detached and self._protocol:
-            try:
-                # Try datagram first (fast, no head-of-line blocking)
-                self._protocol._quic.send_datagram_frame(data)
-                self._protocol.transmit()
-                self.txb += len(data)
-            except Exception:
-                # Datagram too large or not supported — fall back to uni stream
-                try:
-                    if self._loop and self._loop.is_running():
-                        asyncio.run_coroutine_threadsafe(
-                            self._send_stream(data), self._loop
-                        )
-                        self.txb += len(data)
-                except Exception as e:
-                    RNS.log(f"QUIC transmit error on {self}: {e}", RNS.LOG_ERROR)
+            loop = self._loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self._dispatch_send, data)
 
-    async def _send_stream(self, data):
-        """Send data over a unidirectional QUIC stream."""
-        if self._protocol:
-            stream_id = self._protocol._quic.get_next_available_stream_id(is_unidirectional=True)
-            self._protocol._quic.send_stream_data(stream_id, data, end_stream=True)
-            self._protocol.transmit()
+    def _dispatch_send(self, data):
+        """Run on the event loop thread: hand the packet to the protocol."""
+        protocol = self._protocol
+        if protocol is not None and protocol.send_packet(data):
+            self.txb += len(data)
 
     def detach(self):
         self.online  = False
         self.detached = True
         self.OUT = False
         self.IN  = False
-        if self._protocol:
-            try:
-                self._protocol._quic.close()
-                self._protocol.transmit()
-            except: pass
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        loop = self._loop
+        if loop and loop.is_running():
+            # Close the connection and stop the loop on the loop thread, in
+            # that order (call_soon_threadsafe preserves FIFO ordering).
+            loop.call_soon_threadsafe(self._close_protocol)
+            loop.call_soon_threadsafe(loop.stop)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         if self._loop and not self._loop.is_closed():
             self._loop.close()
+
+    def _close_protocol(self):
+        """Close the QUIC connection. MUST run on the event loop thread."""
+        if self._protocol:
+            try:
+                self._protocol._quic.close()
+                self._protocol.transmit()
+            except Exception:
+                pass
 
     def __str__(self):
         return f"QUICInterface[{self.name}/{self.target_host}:{self.target_port}]"
@@ -544,27 +668,8 @@ class QUICServerInterface(_Interface):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self._spawned = None
-                self._last_remote_addr = None
 
             def quic_event_received(self, event):
-                # Detect connection migration by comparing the current
-                # transport remote address to the last known address.
-                # aioquic handles routing internally, so the spawned
-                # interface stays online — we just log the change.
-                if self._transport is not None:
-                    try:
-                        current_addr = self._transport.get_extra_info("peername")
-                    except Exception:
-                        current_addr = None
-                    if current_addr is not None:
-                        if self._last_remote_addr is not None and current_addr != self._last_remote_addr:
-                            RNS.log(
-                                f"QUIC connection migration detected on "
-                                f"{server_interface}: {self._last_remote_addr} -> {current_addr}",
-                                RNS.LOG_DEBUG,
-                            )
-                        self._last_remote_addr = current_addr
-
                 if isinstance(event, DatagramFrameReceived) or isinstance(event, StreamDataReceived):
                     if self._spawned is None:
                         self._spawned = _QUICSpawnedInterface(
@@ -650,34 +755,44 @@ class _QUICSpawnedInterface(_Interface):
             self.owner.inbound(data, self)
 
     def process_outgoing(self, data):
+        # Marshal onto the server's event loop thread (aioquic is not
+        # thread-safe); the actual send happens in _dispatch_send.
         if self.online and not self.detached and self._protocol:
-            try:
-                self._protocol._quic.send_datagram_frame(data)
-                self._protocol.transmit()
-                self.txb += len(data)
-                if self.parent_interface:
-                    self.parent_interface.txb += len(data)
-            except Exception:
-                try:
-                    stream_id = self._protocol._quic.get_next_available_stream_id(
-                        is_unidirectional=True
-                    )
-                    self._protocol._quic.send_stream_data(stream_id, data, end_stream=True)
-                    self._protocol.transmit()
-                    self.txb += len(data)
-                    if self.parent_interface:
-                        self.parent_interface.txb += len(data)
-                except Exception as e:
-                    RNS.log(f"QUIC transmit error on {self}: {e}", RNS.LOG_ERROR)
+            parent = self.parent_interface
+            loop = parent._loop if parent is not None else None
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self._dispatch_send, data)
+
+    def _dispatch_send(self, data):
+        """Run on the event loop thread: hand the packet to the protocol."""
+        protocol = self._protocol
+        if protocol is not None and protocol.send_packet(data):
+            n = len(data)
+            self.txb += n
+            if self.parent_interface:
+                self.parent_interface.txb += n
+
+    def _handle_disconnect(self):
+        # Invoked by the protocol on ConnectionTerminated. The server protocol
+        # also removes this interface from the parent's spawned list.
+        self.online = False
 
     def detach(self):
         self.online  = False
         self.detached = True
+        parent = self.parent_interface
+        loop = parent._loop if parent is not None else None
+        if self._protocol and loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._close_protocol)
+
+    def _close_protocol(self):
+        """Close the QUIC connection. MUST run on the event loop thread."""
         if self._protocol:
             try:
                 self._protocol._quic.close()
                 self._protocol.transmit()
-            except: pass
+            except Exception:
+                pass
 
     def __str__(self):
         return f"QUICInterface[{self.name}]"
